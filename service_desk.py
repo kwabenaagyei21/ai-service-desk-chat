@@ -1,13 +1,15 @@
 import json
 from datetime import datetime, timezone
 from threading import Lock
+from time import sleep
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-MODEL = "gemini-3.1-flash-lite"
+MODEL = "gemini-3.5-flash-lite"
 MAX_OUTPUT_TOKENS = 512
 HISTORY_MESSAGES = 8
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 CATEGORIES = ("incident", "service_request", "needs_clarification")
 TRIAGE_SCHEMA = {
     "type": "object",
@@ -83,23 +85,30 @@ def generate_reply(api_key, history, prompt, custom_instructions, triage, temper
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
-    try:
-        with urlopen(request, timeout=30) as response:
-            payload = json.load(response)
-    except HTTPError as error:
-        if error.code in (401, 403):
-            message = "Gemini denied access. Ask the app owner to check the key and project."
-        elif error.code == 429:
-            message = "Gemini reached a rate or quota limit. Try again later."
-        elif error.code >= 500:
-            message = "Gemini is temporarily unavailable. Try again shortly."
-        else:
-            message = f"Gemini rejected the request (HTTP {error.code})."
-        raise ServiceDeskError(message) from None
-    except (URLError, TimeoutError):
-        raise ServiceDeskError("Could not reach Gemini. Try again shortly.") from None
-    except (ValueError, UnicodeError):
-        raise ServiceDeskError("Gemini returned an unreadable response.") from None
+    for attempt in range(2):
+        try:
+            with urlopen(request, timeout=30) as response:
+                payload = json.load(response)
+            break
+        except HTTPError as error:
+            status = error.code
+            error.close()
+            if attempt == 0 and status in RETRYABLE_STATUS_CODES:
+                sleep(2)
+                continue
+            if status in (401, 403):
+                message = "Gemini denied access. Ask the app owner to check the key and project."
+            elif status == 429:
+                message = "Gemini reached a rate or quota limit. Try again later."
+            elif status >= 500:
+                message = f"Gemini is temporarily unavailable (HTTP {status}). Try again shortly."
+            else:
+                message = f"Gemini rejected the request (HTTP {status})."
+            raise ServiceDeskError(message) from None
+        except (URLError, TimeoutError):
+            raise ServiceDeskError("Could not reach Gemini. Try again shortly.") from None
+        except ValueError:
+            raise ServiceDeskError("Gemini returned an unreadable response.") from None
 
     candidates = payload.get("candidates") or []
     if not candidates:
